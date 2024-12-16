@@ -1,0 +1,116 @@
+# prompt: write me a subclass NDVIgbInferenceMachine that inherits from GeoInferenceMachine. Overwrite tile_input_data to tile up a geotiff (located at self.geotiff_path) according a an instance variable self.tile_dimensions (i.e [256,256] or [512,512]). For each tile, run a function called self.multiband_to_png(tile) to save the tile as png in a folder location self.tiles_folder_path
+
+import os
+from PIL import Image
+
+class NDVIgbInferenceMachine(GeoInferenceMachine):
+    def __init__(self, geotiff_path,
+                 tile_dimensions,
+                 tiles_folder_path,
+                 preds_folder_path,
+                 model_path=None):
+        super().__init__(geotiff_path, tile_dimensions, tiles_folder_path, preds_folder_path, model_path)
+
+    def create_NDVIgb_tile(self,x):
+
+      urb = x[4].copy()
+      perm = x[5].copy()
+      perm[perm==-9999] = 0
+      mask = (urb)*(perm==0) == 0
+
+      NDVIgb = np.array([x[3]*mask, x[1]*mask, x[2]*mask]).transpose(1,2,0)
+
+      NDVIgb = np.flipud(NDVIgb)
+
+      # Rotate -90 degrees (clockwise)
+      NDVIgb = np.rot90(NDVIgb, k=3)  # Rotate by 270 degrees counter-clockwise
+
+      return NDVIgb
+
+    def multiband_to_png(self, tile):
+      NDVIgb = self.create_NDVIgb_tile(tile)
+      image = Image.fromarray((255*NDVIgb).astype(np.uint8))
+      #merged_image = Image.merge('RGB', images[:3]) # Merge first three bands as RGB
+      return image
+
+    def initialize_model(self):
+        # Implement your model initialization logic here
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        loss_func = CrossEntropyLossFlat(axis=1)
+        empty_dls = DataLoaders(DataLoader([], bs=1), DataLoader([], bs=1))
+        body = create_body(convnext_small(), n_in=3, pretrained=True)
+        model = DynamicUnet(body[0], n_out=2, img_size=(244, 244))
+        learn = Learner(empty_dls, model, loss_func=loss_func, cbs=[], lr=1e-3, wd=1e-3, metrics=[DiceMulti(), foreground_acc])
+        learn.load(self.model_path)
+        self.model = learn.model
+        self.model.to(self.device)
+
+    def combine_geotiffs(self, save_location):
+      """
+      Combines all GeoTIFFs in self.preds_folder_path into a single GeoTIFF.
+
+      Args:
+          save_location (str): The path to save the combined GeoTIFF.
+      """
+
+      search_criteria = os.path.join(self.preds_folder_path, '*.tif')
+      geotiff_files = glob.glob(search_criteria)
+
+      if not geotiff_files:
+          print(f"No GeoTIFF files found in {self.preds_folder_path}")
+          return
+
+      src_files_to_mosaic = []
+      for fp in geotiff_files:
+          src = rasterio.open(fp)
+          src_files_to_mosaic.append(src)
+
+      mosaic, out_trans = merge(src_files_to_mosaic)
+
+      # Copy the metadata
+      out_meta = src.meta.copy()
+
+      # Update the metadata
+      out_meta.update({"driver": "GTiff",
+                      "height": mosaic.shape[1],
+                      "width": mosaic.shape[2],
+                      "transform": out_trans,
+                      "crs": src.crs})
+
+      # Write the mosaic raster to disk
+      with rasterio.open(save_location, "w", **out_meta) as dest:
+          dest.write(mosaic)
+
+      # Close the datasets
+      for src in src_files_to_mosaic:
+          src.close()
+
+    def generate_inferences(self, batch_size=10):
+        """
+        Runs ML inference on tiles in batches.
+        """
+        self.initialize_model()
+        tile_paths = [os.path.join(self.tiles_folder_path, tile_path) for tile_path in os.listdir(self.tiles_folder_path) if tile_path.endswith(".png")]
+
+        for i in tqdm(range(0, len(tile_paths), batch_size), desc="Inference Progress"):
+            batch_paths = tile_paths[i:i + batch_size]
+            batch_images = []
+            for tile_full_path in batch_paths:
+                img = PILImage.create(tile_full_path)
+                img_tensor = TensorImage(image2tensor(img)).type(torch.FloatTensor)/255.0
+                batch_images.append(img_tensor)
+
+            # Convert list of tensors to a single tensor
+            batch_tensor = torch.stack(batch_images)
+            batch_tensor = batch_tensor.to(self.device)
+
+            # Perform inference on the batch
+            with torch.no_grad(): # Use no_grad for inference
+              # preds = self.model.eval()(batch_tensor).argmax(dim=1).cpu().numpy()
+              preds = self.model.eval()(batch_tensor).cpu()  # Get raw predictions as numpy array
+              preds = torch.softmax(preds, dim=1).numpy()
+              preds = preds[:,1]
+              # preds = preds[0, :, :, :]
+            # Save predictions individually
+            for j, pred in enumerate(preds):
+                self.png_pred_to_geotiff(batch_paths[j], pred=pred)
