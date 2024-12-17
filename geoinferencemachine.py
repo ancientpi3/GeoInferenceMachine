@@ -92,6 +92,47 @@ class GeoInferenceMachine:
                     dst.write(img_array)
                 else:
                     dst.write(img_array, 1)
+    
+    def combine_geotiffs(self, save_location, search_location):
+      """
+      Combines all GeoTIFFs in self.preds_folder_path into a single GeoTIFF.
+
+      Args:
+          save_location (str): The path to save the combined GeoTIFF.
+      """
+      if not search_location:
+          search_location = self.preds_folder_path
+      search_criteria = os.path.join(search_location, '**/*.tif')
+      geotiff_files = glob.glob(search_criteria)
+
+      if not geotiff_files:
+          print(f"No GeoTIFF files found in {search_location}")
+          return
+
+      src_files_to_mosaic = []
+      for fp in geotiff_files:
+          src = rasterio.open(fp)
+          src_files_to_mosaic.append(src)
+
+      mosaic, out_trans = merge(src_files_to_mosaic)
+
+      # Copy the metadata
+      out_meta = src.meta.copy()
+
+      # Update the metadata
+      out_meta.update({"driver": "GTiff",
+                      "height": mosaic.shape[1],
+                      "width": mosaic.shape[2],
+                      "transform": out_trans,
+                      "crs": src.crs})
+
+      # Write the mosaic raster to disk
+      with rasterio.open(save_location, "w", **out_meta) as dest:
+          dest.write(mosaic)
+
+      # Close the datasets
+      for src in src_files_to_mosaic:
+          src.close()
 
 
     def initialize_model(self):
